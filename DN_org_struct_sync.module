@@ -1,0 +1,172 @@
+<?php
+/**
+ * @file
+ * A module that creates a structure of organisation in taxonomy from field user->ldap_user_current_dn.
+ */
+
+function DN_org_struct_sync_help($path, $arg) {
+	switch ($path) {
+    		case "admin/help#DN_org_struct_sync":
+			return '<p>' . t("LDAP feeds module is able to synchronize LDAP DistinguishedName to ldap_user_current_dn user field. This module parses ldap_user_current_dn user field and creates new taxonomy terms in a particular dictionary according to the structure of organisation from DN, then newly created taxonomy terms are added to their respective users via user field field_department_ref.") . '</p>' .
+			'<p>How to use: <br />
+			<ul>
+			<li>Create taxonomy dictionary, e.g. Departments. </li>
+			<li>Create custom user field "department_ref" (it\'s mandatory to use this name) and connect it to newly created taxonomy dictionary.</li>
+			<li>Configure this module. </li>
+			</ul>
+			That\'s it.</p>';
+			break;
+		}
+}
+
+
+/**
+ * Implements hook_menu().
+ */
+function DN_org_struct_sync_menu() {
+	$items = array();
+	$items['admin/config/people/DN_org_struct_sync'] = array(
+		'title' => 'DN to organisation structure syncronization',
+		'description' => 'Taxonomy terms dictionary for structure of organisation, etc.',
+		'page callback' => 'drupal_get_form',
+		'page arguments' => array('DN_org_struct_sync_form'),
+		'access arguments' => array('access administration pages'),
+		'type' => MENU_NORMAL_ITEM,
+	);
+	return $items;
+}
+
+
+function DN_org_struct_sync_form($form, &$form_state) {
+	$form['DN_org_struct_sync_enabled'] = array(
+		'#type' => 'checkbox',
+		'#title' => t('Enabled'),
+		'#description' => t('Enables this module. Don\'t forget to create dictionary and add a new field to user account called "field_department_ref" in advance.'),
+		'#default_value' => variable_get('DN_org_struct_sync_enabled', False),	
+	);
+	$form['DN_org_struct_exc_base_dn'] = array(
+		'#type' => 'checkbox',
+		'#title' => t('Exclude base DN'),
+		'#description' => t('Do not create base DN in taxonomy'),
+		'#default_value' => variable_get('DN_org_struct_exc_base_dn', False),	
+	);
+	$form['DN_org_struct_sync_force'] = array(
+		'#type' => 'checkbox',
+		'#title' => t('Force recreate'),
+		'#description' => t('If a user has taxonomy terms in given dictionary, they are cleaned and recreated.'),
+		'#default_value' => variable_get('DN_org_struct_sync_force', False),	
+	);
+	$form['DN_org_struct_sync_verbose'] = array(
+		'#type' => 'checkbox',
+		'#title' => t('Verbose'),
+		'#description' => t('Be verbose'),
+		'#default_value' => variable_get('DN_org_struct_sync_verbose', False),	
+	);
+	$form['DN_org_struct_sync_vid'] = array(
+		'#type' => 'textfield',
+		'#title' => t('Taxonomy vocabulary ID'),
+		'#default_value' => variable_get('DN_org_struct_sync_vid', ''),
+		'#description' => t('where taxonomy terms will be created, leave empty to disable this module'),
+		'#required' => TRUE,
+		'#size' => 30,
+		'#maxlength' => 128,
+	);
+	return system_settings_form($form);
+}
+
+
+/**
+ * Find taxonomy term by its parent and vocabulaty id or creates a new one if nothibg found
+ * Return term id
+ */
+function _tid_get_or_create($name, $pid, $vocab) {
+	# get root node
+	if ($pid === 0) { 
+		$terms = taxonomy_get_term_by_name($name, $vocab->machine_name);
+		foreach ($terms as $term) {
+			if ( empty(taxonomy_get_parents($term->tid)) ) return $term->tid;
+		}
+	}
+	# get child node
+	else {
+		$childs = taxonomy_get_children($pid, $vocab->vid);
+		foreach ($childs as $child) {
+			if ($child->name == $name) return $child->tid;
+		}
+	}
+	# create
+	$term = new stdClass();
+	$term->name = $name;
+	$term->description = '';
+	$term->parent = $pid;
+	$term->vid = $vocab->vid;
+	taxonomy_term_save($term);		
+	return $term->tid; 
+}
+
+
+/**
+ * Implements cron job.
+ */
+function DN_org_struct_sync_cron() {
+	$enabled = variable_get('DN_org_struct_sync_enabled', False);
+	if (! $enabled) return;
+	$vocabulary_machine_name = variable_get('DN_org_struct_sync_vid', '');
+	if (!$vocabulary_machine_name) return;
+	$vocab = taxonomy_vocabulary_machine_name_load($vocabulary_machine_name);
+	if (!$vocab) {
+		drupal_set_message( 'DN_org_struct_sync: Taxonomy vocabulary "' . $vocabulary_machine_name . '" not found', 'error');
+		return;
+	}
+	drupal_set_message( 'DN_org_struct_sync: module started', 'status');
+	$verbose = variable_get('DN_org_struct_sync_verbose', False);
+	$force = variable_get('DN_org_struct_sync_force', False);
+	$exc_base_dn = variable_get('DN_org_struct_exc_base_dn', False);
+	$uids = db_query('SELECT uid FROM {users} WHERE uid > 1 and status = 1')->fetchCol();
+	$users = user_load_multiple($uids);
+	$user_cnt = 0;
+	foreach ($users as $user) {
+		if ($force) {
+			$tag_cnt = 0;
+			while ( !empty($user->field_department_ref['und'][$tag_cnt]['tid']) ) {
+				$user->field_department_ref['und'][$tag_cnt]['tid'] = NULL;
+				$tag_cnt++;
+			}
+		}
+		if (!empty($user->field_department_ref['und'][0]['tid']) && taxonomy_term_load($user->field_department_ref['und'][0]['tid']) ) continue;
+		$uid = $user->uid;
+		$dn = $user->ldap_user_current_dn['und'][0]['value'];
+		$dn = str_replace(',DC=moesk51,DC=ru', '', $dn);
+		$dn = str_replace('\,', ',', $dn);
+		$dn_r = explode( ',OU=', $dn);
+		$fname = $dn_r[0];
+		$fname = str_replace('CN=', '', $fname);
+		$dn_r = array_slice($dn_r, 1);
+		$dn_r = array_reverse($dn_r);
+		if ($exc_base_dn) $dn_r = array_slice($dn_r, 1);
+		if ($verbose) {
+			$str = implode( ',', $dn_r);
+			drupal_set_message( 'DN_org_struct_sync: ' . $uid . ': ' . $str . ' -> ' . $fname, 'warning');
+		}
+		$pid = 0;
+		$tag_cnt = 0;
+		foreach ($dn_r as $department) {
+			$pid = _tid_get_or_create($department, $pid, $vocab);
+			$user->field_department_ref['und'][$tag_cnt++]['tid'] = $pid;
+		}
+		$save_res = NULL;
+                try {
+                	$save_res = user_save($user);
+                }
+                catch (Exception $e) {
+                	drupal_set_message( 'DN_org_struct_sync: UID: ' . $uid . '. Save user exception: ' . $e->getMessage(), 'error');
+                	continue;
+                }
+		if ( $save_res ) $user_cnt++;
+		else {
+			$str = implode( ',', $dn_r);
+			drupal_set_message( 'DN_org_struct_sync: user save failed! ' . $uid . ': ' . $str . ' -> ' . $fname, 'error');
+		}
+	}
+	drupal_set_message( 'DN_org_struct_sync: ' . $user_cnt . ' users synchronized successfully', 'status');
+}

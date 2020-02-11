@@ -1,0 +1,5 @@
+name = DN to organisation structure syncronization
+description = Module that creates organisation structure in taxonomy terms according to DN in a user field.
+core = 7.x
+package = Moesk
+configure = admin/config/people/DN_org_struct_sync
